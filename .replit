@@ -29,3 +29,10 @@ args = "python sv.py"
 
 [workflows.workflow.metadata]
 outputType = "console"
+
+[userenv]
+
+[userenv.shared]
+BATCH_SIZE = "5000"
+DELAY = "1"
+PAUSE_HOURS = "0"

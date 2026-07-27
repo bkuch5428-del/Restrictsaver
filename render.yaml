@@ -1,0 +1,27 @@
+services:
+  - type: worker
+    name: telegram-channel-forwarder
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python sv.py
+    envVars:
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: SESSION_STRING
+        sync: false
+      - key: SOURCE_CHANNEL
+        sync: false
+      - key: DESTINATION_CHANNEL
+        sync: false
+      - key: START_POST_ID
+        value: "2"
+      - key: BATCH_SIZE
+        value: "1000"
+      - key: DELAY
+        value: "5"
+      - key: PAUSE_HOURS
+        value: "3"
+      - key: MAX_RETRIES
+        value: "3"

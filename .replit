@@ -1,7 +1,31 @@
 modules = ["python-3.12"]
+run = "python sv.py"
 
 [nix]
 channel = "stable-25_05"
 
 [agent]
 expertMode = true
+
+[workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Telegram Forwarder"
+
+[[workflows.workflow]]
+name = "Telegram Forwarder"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python sv.py"
+
+[workflows.workflow.metadata]
+outputType = "console"

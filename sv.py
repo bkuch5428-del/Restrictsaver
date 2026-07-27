@@ -21,6 +21,16 @@ from telethon.tl.types import (
     DocumentAttributeFilename,
 )
 
+# cryptg is an optional C-extension that accelerates Telethon's encryption.
+# It requires a C compiler and may not build on all Python versions or
+# platforms (e.g. Python 3.14, Render free tier).  Telethon falls back to
+# its pure-Python implementation automatically when cryptg is absent.
+try:
+    import cryptg  # noqa: F401
+    _CRYPTG = True
+except ImportError:
+    _CRYPTG = False
+
 # ─────────────────────────────────────────────
 #  Logging
 # ─────────────────────────────────────────────

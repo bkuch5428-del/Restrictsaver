@@ -1,9 +1,10 @@
 services:
-  - type: worker
+  - type: web
     name: telegram-channel-forwarder
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python sv.py
+    healthCheckPath: /
     envVars:
       - key: API_ID
         sync: false
@@ -18,10 +19,10 @@ services:
       - key: START_POST_ID
         value: "2"
       - key: BATCH_SIZE
-        value: "1000"
+        value: "5000"
       - key: DELAY
-        value: "5"
+        value: "1"
       - key: PAUSE_HOURS
-        value: "3"
+        value: "0"
       - key: MAX_RETRIES
         value: "3"

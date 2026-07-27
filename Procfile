@@ -1,1 +1,1 @@
-worker: python sv.py
+web: python sv.py

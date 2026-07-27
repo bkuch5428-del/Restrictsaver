@@ -7,10 +7,12 @@ import random
 import subprocess
 import sys
 import glob
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodWaitError, AuthKeyDuplicatedError
 from telethon.tl.types import (
     MessageMediaDocument,
     MessageMediaPhoto,
@@ -568,7 +570,27 @@ async def forward_batch(start_id: int):
         empty_history_pause = pause_seconds
 
     try:
-        await client.start()
+        # AuthKeyDuplicatedError means another live instance holds this session.
+        # Never give up — disconnect, wait with capped backoff, and keep retrying
+        # until the other instance releases it (or is stopped).
+        _connect_attempt = 0
+        while True:
+            _connect_attempt += 1
+            try:
+                await client.start()
+                break
+            except AuthKeyDuplicatedError:
+                wait = min(_connect_attempt * 15, 300)
+                logger.warning(
+                    f"⚠️  AuthKeyDuplicated — another active instance holds this "
+                    f"SESSION_STRING. Stop the other instance to continue. "
+                    f"Waiting {wait}s before retry (attempt {_connect_attempt}) …"
+                )
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                await asyncio.sleep(wait)
         logger.info("🔗 Connected to Telegram")
         if not FFPROBE_OK:
             logger.warning(
@@ -665,8 +687,52 @@ async def forward_batch(start_id: int):
         await disconnect_client()
 
 
+# ─────────────────────────────────────────────
+#  Health server (Render / Railway web service)
+# ─────────────────────────────────────────────
+_HEALTH_PORT = int(os.environ.get("PORT", 8000))
+
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    """Minimal HTTP handler — returns 200 OK for any GET request."""
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):  # noqa: A002
+        pass  # suppress per-request access logs
+
+
+def _start_health_server():
+    server = HTTPServer(("0.0.0.0", _HEALTH_PORT), _HealthHandler)
+    logger.info(f"🌐 Health server listening on port {_HEALTH_PORT}")
+    server.serve_forever()
+
+
 if __name__ == "__main__":
-    try:
-        asyncio.run(forward_batch(START_POST_ID))
-    except KeyboardInterrupt:
-        logger.info("Shutdown requested; exiting cleanly.")
+    # Start the health server in a background daemon thread so it never
+    # blocks or outlives the main process.  It must stay alive even while the
+    # forwarder is waiting to reconnect (e.g. AuthKeyDuplicated, network drop).
+    _health_thread = threading.Thread(target=_start_health_server, daemon=True)
+    _health_thread.start()
+
+    _restart_delay = 30  # seconds between top-level restarts
+    while True:
+        try:
+            asyncio.run(forward_batch(START_POST_ID))
+            # forward_batch only returns on a clean exit (shouldn't happen in
+            # normal operation) — restart immediately.
+            logger.info("forward_batch exited cleanly; restarting …")
+        except KeyboardInterrupt:
+            logger.info("Shutdown requested; exiting cleanly.")
+            break
+        except Exception as exc:
+            logger.error(
+                f"💥 Unexpected top-level crash: {exc}. "
+                f"Restarting forwarder in {_restart_delay}s …"
+            )
+            import time as _time
+            _time.sleep(_restart_delay)

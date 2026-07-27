@@ -36,3 +36,7 @@ outputType = "console"
 BATCH_SIZE = "5000"
 DELAY = "1"
 PAUSE_HOURS = "0"
+
+[[ports]]
+localPort = 8000
+externalPort = 80

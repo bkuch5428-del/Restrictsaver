@@ -309,7 +309,13 @@ async def send_document(file_path: str, caption: str):
 async def get_channel_entity(channel_id: int):
     try:
         entity = await client.get_entity(channel_id)
-        logger.info(f"Resolved channel: {entity.title}  (ID: {entity.id})")
+        entity_name = (
+            getattr(entity, "title", None)
+            or getattr(entity, "username", None)
+            or getattr(entity, "first_name", None)
+            or str(channel_id)
+        )
+        logger.info(f"Resolved channel: {entity_name}  (ID: {entity.id})")
         return entity
     except ValueError as e:
         logger.error(f"Cannot resolve channel {channel_id}: {e}")
@@ -323,21 +329,29 @@ async def get_channel_entity(channel_id: int):
 # ─────────────────────────────────────────────
 #  Per-message forwarder
 # ─────────────────────────────────────────────
-async def forward_single_message(source_entity, msg_id: int):
+async def forward_single_message(source_entity, msg_id: int, message=None):
     """
     Returns:
       True  — forwarded or gracefully skipped
       False — all retries exhausted
-      None  — no message (end of channel)
+      None  — the requested message does not exist
+
+    ``message`` is normally supplied by ``fetch_message_batch``.  Keeping the
+    fallback lookup makes this function safe to call independently and keeps
+    the message-forwarding behavior unchanged.
     """
     for attempt in range(1, MAX_RETRIES + 1):
         file_path = None
         thumb     = None
         try:
-            message = await client.get_messages(source_entity, ids=msg_id)
+            if message is None:
+                message = await client.get_messages(source_entity, ids=msg_id)
 
             if not message:
-                logger.info(f"[{msg_id}] No message — end of channel.")
+                logger.info(
+                    f"[{msg_id}] No message returned for this ID. "
+                    "This is a deleted/empty ID, not an end-of-channel signal."
+                )
                 return None
 
             kind    = get_media_kind(message)
@@ -394,13 +408,167 @@ async def forward_single_message(source_entity, msg_id: int):
 
 
 # ─────────────────────────────────────────────
+#  History fetch and empty-history diagnostics
+# ─────────────────────────────────────────────
+async def log_empty_history_reasons(source_entity, requested_start_id: int):
+    """
+    Explain why a history query returned no messages.
+
+    Telegram message IDs are not guaranteed to be contiguous: deleted posts
+    leave holes.  Therefore an empty result is diagnostic information only;
+    it must never be treated as proof that the channel has ended.
+    """
+    logger.warning(
+        f"No messages returned for SOURCE_CHANNEL={SOURCE_CHANNEL} at or after "
+        f"message ID {requested_start_id}."
+    )
+    logger.warning(
+        "Possible reasons: the channel has no accessible messages; "
+        "START_POST_ID is newer than the latest message; messages at or after "
+        "START_POST_ID were deleted; the account cannot read the requested "
+        "history; or Telegram returned an empty page temporarily."
+    )
+
+    try:
+        latest_messages = await client.get_messages(source_entity, limit=1)
+    except Exception as e:
+        logger.warning(
+            "Could not inspect the latest source message while diagnosing the "
+            f"empty result (source inaccessible or Telegram/API error): {e}"
+        )
+        return
+
+    if not latest_messages:
+        logger.warning(
+            "Diagnostic result: Telegram returned no latest message. "
+            "The source may be empty, inaccessible, or have no readable history."
+        )
+        return
+
+    latest_message = latest_messages[0]
+    latest_id = getattr(latest_message, "id", None)
+    if latest_id is None:
+        logger.warning(
+            "Diagnostic result: Telegram returned an object without a message ID."
+        )
+    elif latest_id < requested_start_id:
+        logger.warning(
+            f"Diagnostic result: latest accessible message ID is {latest_id}, "
+            f"which is before requested START_POST_ID={requested_start_id}."
+        )
+    else:
+        logger.warning(
+            f"Diagnostic result: latest accessible message ID is {latest_id}, "
+            f"but no message was returned from {requested_start_id} onward. "
+            "The requested IDs may be deleted/inaccessible, or the empty page "
+            "may be temporary."
+        )
+
+
+async def fetch_message_batch(source_entity, start_id: int):
+    """
+    Fetch up to BATCH_SIZE real messages in ascending ID order.
+
+    ``iter_messages`` handles Telegram's pagination internally.  ``min_id`` is
+    exclusive in Telethon, so ``start_id - 1`` makes START_POST_ID inclusive.
+    Deleted IDs are skipped by Telegram and do not terminate the scan.
+    """
+    logger.info(
+        f"Fetching source history | SOURCE_CHANNEL={SOURCE_CHANNEL} | "
+        f"min requested ID={start_id} (inclusive) | limit={BATCH_SIZE} | "
+        "reverse=True (ascending, paginated)"
+    )
+
+    messages = []
+    try:
+        async for message in client.iter_messages(
+            source_entity,
+            min_id=max(0, start_id - 1),
+            reverse=True,
+            limit=BATCH_SIZE,
+        ):
+            if message is None:
+                logger.warning(
+                    "Telegram pagination yielded an empty message object; "
+                    "skipping it and continuing pagination."
+                )
+                continue
+            if getattr(message, "id", None) is None:
+                logger.warning(
+                    "Telegram pagination yielded a message without an ID; "
+                    "skipping it and continuing pagination."
+                )
+                continue
+            messages.append(message)
+    except Exception as e:
+        logger.error(
+            f"History fetch failed for SOURCE_CHANNEL={SOURCE_CHANNEL}, "
+            f"requested start ID {start_id}: {e}"
+        )
+        logger.warning(
+            "No messages can be reported for this fetch because the history "
+            "request failed. The forwarder will retry after the configured "
+            "pause; check channel access and Telegram connectivity."
+        )
+        return []
+
+    if not messages:
+        await log_empty_history_reasons(source_entity, start_id)
+        return []
+
+    first_id = getattr(messages[0], "id", None)
+    last_id = getattr(messages[-1], "id", None)
+    logger.info(
+        f"History fetch returned {len(messages)} messages | "
+        f"first message ID={first_id} | last message ID={last_id}"
+    )
+    return messages
+
+
+async def disconnect_client():
+    """Disconnect Telethon exactly once while its event loop is still alive."""
+    if not client.is_connected():
+        logger.info("Telegram client is already disconnected.")
+        return
+
+    logger.info("Disconnecting Telegram client cleanly …")
+    try:
+        await client.disconnect()
+    except (OSError, ValueError) as e:
+        # Telethon can encounter a socket that was already closed during
+        # interpreter shutdown.  Log it without allowing shutdown to turn into
+        # a noisy traceback.
+        if "Invalid file descriptor: -1" in str(e):
+            logger.warning(
+                "Telegram socket was already closed during disconnect; "
+                "shutdown completed safely."
+            )
+        else:
+            raise
+
+
+# ─────────────────────────────────────────────
 #  Batch loop
 # ─────────────────────────────────────────────
 async def forward_batch(start_id: int):
     # Wipe any leftover files from a previous crashed run
     cleanup_downloads()
 
-    async with client:
+    if start_id < 1:
+        raise ValueError(f"START_POST_ID must be >= 1, got {start_id}")
+    if BATCH_SIZE < 1:
+        raise ValueError(f"BATCH_SIZE must be >= 1, got {BATCH_SIZE}")
+
+    pause_seconds = max(0, PAUSE_HOURS * 3600)
+    if pause_seconds == 0:
+        # A zero pause is useful for tests, but a zero-second empty-history
+        # retry would otherwise create a tight API loop.
+        empty_history_pause = 5
+    else:
+        empty_history_pause = pause_seconds
+
+    try:
+        await client.start()
         logger.info("🔗 Connected to Telegram")
         if not FFPROBE_OK:
             logger.warning(
@@ -409,48 +577,96 @@ async def forward_batch(start_id: int):
             )
 
         source_entity = await get_channel_entity(SOURCE_CHANNEL)
+        destination_entity = await get_channel_entity(DESTINATION_CHANNEL)
         logger.info(
-            f"▶️  Forwarder started | "
-            f"Source: {SOURCE_CHANNEL} → Dest: {DESTINATION_CHANNEL} | "
-            f"From ID: {start_id}"
+            f"▶️  Forwarder started | SOURCE_CHANNEL={SOURCE_CHANNEL} "
+            f"→ DESTINATION_CHANNEL={DESTINATION_CHANNEL} | "
+            f"START_POST_ID={start_id} | BATCH_SIZE={BATCH_SIZE} | "
+            f"DELAY={DELAY}s | PAUSE_HOURS={PAUSE_HOURS}"
+        )
+        logger.info(
+            f"Destination resolved and validated: "
+            f"{getattr(destination_entity, 'title', None) or DESTINATION_CHANNEL}"
         )
 
-        message_id  = start_id
+        next_message_id = start_id
         batch_count = 0
-        total_fwd   = 0
+        total_fwd = 0
+        total_found = 0
+        first_found_id = None
+        last_found_id = None
 
         while True:
-            end_id = message_id + BATCH_SIZE
-            logger.info(f"── Batch {batch_count + 1}: IDs {message_id} → {end_id - 1} ──")
+            messages = await fetch_message_batch(source_entity, next_message_id)
+            if not messages:
+                logger.info(
+                    f"No messages found at or after ID {next_message_id}. "
+                    f"History found so far: {total_found}; total forwarded: "
+                    f"{total_fwd}; first found ID: {first_found_id}; "
+                    f"last found ID: {last_found_id}. "
+                    f"Forwarder remains alive and will retry in "
+                    f"{empty_history_pause}s."
+                )
+                await asyncio.sleep(empty_history_pause)
+                continue
 
-            for msg_id in range(message_id, end_id):
-                result = await forward_single_message(source_entity, msg_id)
+            batch_count += 1
+            batch_first_id = getattr(messages[0], "id", None)
+            batch_last_id = getattr(messages[-1], "id", None)
+            total_found += len(messages)
+            if first_found_id is None:
+                first_found_id = batch_first_id
+            last_found_id = batch_last_id
+            logger.info(
+                f"── Batch {batch_count}: {len(messages)} messages found | "
+                f"first ID={batch_first_id} | last ID={batch_last_id} | "
+                f"total messages found={total_found} ──"
+            )
 
-                if result is None:
-                    logger.info(f"🏁 Done. Total forwarded: {total_fwd}")
-                    cleanup_downloads()
-                    return
+            for processed, message in enumerate(messages, start=1):
+                msg_id = getattr(message, "id", None)
+                if msg_id is None:
+                    logger.warning(
+                        "Fetched message has no ID; skipping it and continuing."
+                    )
+                    continue
+
+                result = await forward_single_message(
+                    source_entity,
+                    msg_id,
+                    message=message,
+                )
 
                 if result:
                     total_fwd += 1
 
-                processed = msg_id - message_id + 1
                 if processed % 50 == 0:
                     logger.info(
-                        f"  📊 {processed}/{BATCH_SIZE} in batch | "
+                        f"  📊 {processed}/{len(messages)} in batch | "
                         f"Total: {total_fwd}"
                     )
 
                 await asyncio.sleep(DELAY)
 
-            batch_count += 1
-            message_id = end_id
+            # The iterator returns ascending IDs.  Advance by the last actual
+            # message ID, not by BATCH_SIZE, so deleted ID gaps are harmless.
+            next_message_id = max(
+                getattr(message, "id", next_message_id) for message in messages
+            ) + 1
             logger.info(
-                f"✔️  Batch {batch_count} done — "
-                f"pausing {PAUSE_HOURS}h …"
+                f"✔️  Batch {batch_count} done | next history ID="
+                f"{next_message_id} | total messages found={total_found} | "
+                f"first found ID={first_found_id} | last found ID={last_found_id} | "
+                f"total forwarded={total_fwd} | pausing {pause_seconds}s …"
             )
-            await asyncio.sleep(PAUSE_HOURS * 3600)
+            await asyncio.sleep(pause_seconds)
+    finally:
+        cleanup_downloads()
+        await disconnect_client()
 
 
 if __name__ == "__main__":
-    asyncio.run(forward_batch(START_POST_ID))
+    try:
+        asyncio.run(forward_batch(START_POST_ID))
+    except KeyboardInterrupt:
+        logger.info("Shutdown requested; exiting cleanly.")

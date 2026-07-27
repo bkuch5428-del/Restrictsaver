@@ -1,0 +1,1 @@
+- [Telegram history pagination](telegram-history-pagination.md) — Telegram message IDs can have gaps; missing IDs must not be treated as end-of-channel.

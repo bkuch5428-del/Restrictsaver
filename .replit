@@ -33,9 +33,9 @@ outputType = "console"
 [userenv]
 
 [userenv.shared]
-BATCH_SIZE = "5000"
-DELAY = "1"
-PAUSE_HOURS = "0"
+BATCH_SIZE = "1000"
+DELAY = "5"
+PAUSE_HOURS = "1"
 
 [[ports]]
 localPort = 8000

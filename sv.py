@@ -68,9 +68,6 @@ DOWNLOAD_DIR.mkdir(exist_ok=True)
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".webm", ".m4v", ".3gp"}
 AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".ogg", ".flac", ".wav", ".opus"}
 
-client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-
-
 # ─────────────────────────────────────────────
 #  ffprobe helpers
 # ─────────────────────────────────────────────
@@ -563,6 +560,13 @@ async def disconnect_client():
 #  Batch loop
 # ─────────────────────────────────────────────
 async def forward_batch(start_id: int):
+    # TelegramClient is created here (inside asyncio.run) so that Telethon's
+    # __init__ never calls asyncio.get_event_loop() outside a running loop.
+    # Python 3.14 removed implicit event-loop creation on the main thread,
+    # which caused "RuntimeError: There is no current event loop in thread
+    # 'MainThread'" when the client was instantiated at module level.
+    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+
     # Wipe any leftover files from a previous crashed run
     cleanup_downloads()
 

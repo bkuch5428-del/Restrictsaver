@@ -36,6 +36,8 @@ outputType = "console"
 BATCH_SIZE = "1000"
 DELAY = "5"
 PAUSE_HOURS = "1"
+DESTINATION_CHANNEL = "-1003867705863"
+SOURCE_CHANNEL = "-1003567650389"
 
 [[ports]]
 localPort = 8000

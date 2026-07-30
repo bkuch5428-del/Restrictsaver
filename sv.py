@@ -61,6 +61,7 @@ BATCH_SIZE          = get_env("BATCH_SIZE",          cast=int,   required=False,
 DELAY               = get_env("DELAY",               cast=float, required=False, default="5")
 PAUSE_HOURS         = get_env("PAUSE_HOURS",         cast=float, required=False, default="3")
 MAX_RETRIES         = get_env("MAX_RETRIES",         cast=int,   required=False, default="3")
+MONGO_URI           = get_env("MONGO_URI",                       required=False)
 
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
@@ -72,6 +73,85 @@ AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".ogg", ".flac", ".wav", ".opus"}
 # global can be defined before the event loop starts.  The real instance is
 # created inside forward_batch() once asyncio.run() has established a loop.
 client = None
+
+# ─────────────────────────────────────────────
+#  MongoDB checkpoint
+# ─────────────────────────────────────────────
+_CHECKPOINT_ID = "forwarder_checkpoint"
+
+
+def _mongo_connect():
+    """
+    Connect to MongoDB and return the checkpoints collection, or None if
+    MONGO_URI is absent or the server is unreachable.  Never raises — MongoDB
+    is optional; the forwarder continues without it if unavailable.
+    """
+    if not MONGO_URI:
+        logger.info("MONGO_URI not set — checkpoint persistence disabled.")
+        return None
+    try:
+        from pymongo import MongoClient
+        mc = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5_000)
+        mc.admin.command("ping")            # fail-fast if unreachable
+        try:
+            db = mc.get_default_database()  # db name from URI path
+        except Exception:
+            db = mc["telegram_forwarder"]   # fallback when URI has no db name
+        col = db["checkpoints"]
+        logger.info("✓ Connected to MongoDB")
+        return col
+    except Exception as exc:
+        logger.warning(
+            f"⚠️  MongoDB unavailable — checkpoint persistence disabled: {exc}"
+        )
+        return None
+
+
+def _load_checkpoint(col) -> int | None:
+    """Return the last successfully forwarded message ID, or None."""
+    if col is None:
+        return None
+    try:
+        doc = col.find_one({"_id": _CHECKPOINT_ID})
+        if doc and "last_message_id" in doc:
+            return int(doc["last_message_id"])
+        return None
+    except Exception as exc:
+        logger.warning(f"⚠️  Failed to read checkpoint from MongoDB: {exc}")
+        return None
+
+
+async def _save_checkpoint(col, msg_id: int) -> None:
+    """
+    Atomically upsert the checkpoint document.  The blocking pymongo call is
+    dispatched to the default thread executor so the asyncio event loop is
+    never stalled.  Called only after a confirmed successful forward — never
+    on failure.  Never raises.
+    """
+    if col is None:
+        return
+
+    import datetime
+
+    def _upsert():
+        col.update_one(
+            {"_id": _CHECKPOINT_ID},
+            {
+                "$set": {
+                    "last_message_id": msg_id,
+                    "updated_at": datetime.datetime.now(datetime.timezone.utc),
+                }
+            },
+            upsert=True,
+        )
+
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _upsert)
+        logger.info(f"✓ Checkpoint saved: {msg_id}")
+    except Exception as exc:
+        logger.warning(f"⚠️  Failed to save checkpoint {msg_id}: {exc}")
+
 
 # ─────────────────────────────────────────────
 #  ffprobe helpers
@@ -631,7 +711,17 @@ async def forward_batch(start_id: int):
             f"{getattr(destination_entity, 'title', None) or DESTINATION_CHANNEL}"
         )
 
-        next_message_id = start_id
+        # ── MongoDB checkpoint ──────────────────────────────────────────────
+        _ckpt_col  = _mongo_connect()
+        _last_ckpt = _load_checkpoint(_ckpt_col)
+        if _last_ckpt is not None:
+            logger.info(f"✓ Loaded checkpoint: {_last_ckpt}")
+            next_message_id = _last_ckpt + 1
+            logger.info(f"✓ Resuming from: {next_message_id}")
+        else:
+            next_message_id = start_id
+        # ───────────────────────────────────────────────────────────────────
+
         batch_count = 0
         total_fwd = 0
         total_found = 0
@@ -681,6 +771,13 @@ async def forward_batch(start_id: int):
 
                 if result:
                     total_fwd += 1
+
+                # Save checkpoint after every confirmed-processed message:
+                #   True  → forwarded or gracefully skipped  → advance
+                #   None  → message ID does not exist        → advance
+                #   False → all retries exhausted            → do NOT advance
+                if result is not False:
+                    await _save_checkpoint(_ckpt_col, msg_id)
 
                 if processed % 50 == 0:
                     logger.info(

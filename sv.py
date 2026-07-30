@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError, AuthKeyDuplicatedError
+from telethon.errors import FloodWaitError, AuthKeyDuplicatedError, FileReferenceExpiredError
 from telethon.tl.types import (
     MessageMediaDocument,
     MessageMediaPhoto,
@@ -489,6 +489,24 @@ async def forward_single_message(source_entity, msg_id: int, message=None):
             await asyncio.sleep(e.seconds + 5)
             # Don't count flood waits as a retry attempt
             continue
+
+        except FileReferenceExpiredError:
+            # Telegram file references expire after a short window.  Re-fetch
+            # the original message to obtain fresh references, then let the
+            # retry loop attempt the download again.  Counts as one retry so
+            # the loop terminates if the refresh consistently fails.
+            safe_delete(file_path, thumb)
+            if attempt < MAX_RETRIES:
+                logger.warning(
+                    f"[{msg_id}] 🔄 File reference expired — "
+                    f"re-fetching message (attempt {attempt}/{MAX_RETRIES}) …"
+                )
+                message = None  # cleared so the next iteration re-fetches it
+            else:
+                logger.error(
+                    f"[{msg_id}] ❌ File reference could not be refreshed "
+                    f"after {MAX_RETRIES} retries — skipping."
+                )
 
         except Exception as e:
             safe_delete(file_path, thumb)
